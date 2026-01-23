@@ -162,9 +162,12 @@ class Joystick(go1_base.Go1Env):
     qpos = qpos.at[3:7].set(new_quat)
 
     # d(xyzrpy)=U(-0.5, 0.5)
+    # SCPO Fix 97: Reduce initial velocity perturbations to prevent immediate falling
+    # Original: ±0.5 m/s caused robot to fall before policy could respond
+    # Reduced to ±0.1 m/s to give policy a chance to stabilize
     rng, key = jax.random.split(rng)
     qvel = qvel.at[0:6].set(
-        jax.random.uniform(key, (6,), minval=-0.5, maxval=0.5)
+        jax.random.uniform(key, (6,), minval=-0.1, maxval=0.1)
     )
 
     data = mjx_env.make_data(
