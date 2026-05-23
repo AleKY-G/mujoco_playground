@@ -73,6 +73,8 @@ def default_config() -> config_dict.ConfigDict:
               feet_height=-0.2,
               feet_slip=-0.1,
               feet_air_time=0.1,
+              # Forward progress (terrain traversal incentive).
+              forward_progress=0.3,
           ),
           tracking_sigma=0.25,
           max_foot_height=0.1,
@@ -89,6 +91,9 @@ def default_config() -> config_dict.ConfigDict:
           # Probability of not zeroing out new command.
           b=[0.9, 0.25, 0.5],
       ),
+      stagnation_termination=False,
+      stagnation_check_interval=250,  # Steps between checks (~5s at 50Hz).
+      stagnation_min_displacement=0.3,  # Meters.
       impl="jax",
       nconmax=4 * 8192,
       njmax=40,
@@ -117,6 +122,20 @@ class Joystick(go1_base.Go1Env):
   def _post_init(self) -> None:
     self._init_q = jp.array(self._mj_model.keyframe("home").qpos)
     self._default_pose = jp.array(self._mj_model.keyframe("home").qpos[7:])
+
+    # Detect heightfield for terrain-aware spawning and height observations.
+    self._has_heightfield = self._mj_model.nhfield > 0
+    if self._has_heightfield:
+      hf = self._mj_model.hfield_size[0]  # (x_half, y_half, z_scale, z_base)
+      self._hfield_x_half = float(hf[0])
+      self._hfield_y_half = float(hf[1])
+      self._hfield_z_scale = float(hf[2])
+      self._hfield_nrow = int(self._mj_model.hfield_nrow[0])
+      self._hfield_ncol = int(self._mj_model.hfield_ncol[0])
+      self._hfield_data = jp.array(
+          self._mj_model.hfield_data[:self._hfield_nrow * self._hfield_ncol]
+          .reshape(self._hfield_nrow, self._hfield_ncol)
+      )
 
     # Note: First joint is freejoint.
     self._lowers, self._uppers = self.mj_model.jnt_range[1:].T
@@ -147,6 +166,82 @@ class Joystick(go1_base.Go1Env):
     self._cmd_a = jp.array(self._config.command_config.a)
     self._cmd_b = jp.array(self._config.command_config.b)
 
+  def _get_terrain_height(self, x: jax.Array, y: jax.Array) -> jax.Array:
+    """Query heightfield height at world coordinates (x, y).
+
+    Converts world position to heightfield grid indices and performs
+    bilinear interpolation. Returns 0.0 if no heightfield is present.
+
+    Must be JAX-compatible (no Python if on traced values).
+    """
+    if not self._has_heightfield:
+      return jp.float32(0.0)
+
+    # World coords to normalized [0, 1] in heightfield space.
+    # Heightfield is centered at origin, extends [-x_half, x_half].
+    u = (x + self._hfield_x_half) / (2.0 * self._hfield_x_half)
+    v = (y + self._hfield_y_half) / (2.0 * self._hfield_y_half)
+
+    # Clamp to valid range
+    u = jp.clip(u, 0.0, 1.0)
+    v = jp.clip(v, 0.0, 1.0)
+
+    # Convert to grid coordinates (row, col)
+    row_f = u * (self._hfield_nrow - 1)
+    col_f = v * (self._hfield_ncol - 1)
+
+    # Integer indices for bilinear interpolation
+    r0 = jp.floor(row_f).astype(jp.int32)
+    c0 = jp.floor(col_f).astype(jp.int32)
+    r1 = jp.minimum(r0 + 1, self._hfield_nrow - 1)
+    c1 = jp.minimum(c0 + 1, self._hfield_ncol - 1)
+
+    # Fractional parts
+    fr = row_f - r0.astype(jp.float32)
+    fc = col_f - c0.astype(jp.float32)
+
+    # Bilinear interpolation of normalized [0, 1] hfield_data
+    h00 = self._hfield_data[r0, c0]
+    h01 = self._hfield_data[r0, c1]
+    h10 = self._hfield_data[r1, c0]
+    h11 = self._hfield_data[r1, c1]
+
+    h = (h00 * (1 - fr) * (1 - fc) +
+         h01 * (1 - fr) * fc +
+         h10 * fr * (1 - fc) +
+         h11 * fr * fc)
+
+    # Convert from normalized [0, 1] to world height
+    return h * self._hfield_z_scale
+
+  def _get_height_samples(self, data: mjx.Data) -> jax.Array:
+    """Sample 9x7 terrain heights around robot, relative to robot z.
+
+    Grid: 9 points along x (±0.6m), 7 points along y (±0.4m) = 63 values.
+    Returns zeros if no heightfield is present.
+    """
+    if not self._has_heightfield:
+      return jp.zeros(63)
+
+    robot_x = data.qpos[0]
+    robot_y = data.qpos[1]
+    robot_z = data.qpos[2]
+
+    # Sample grid in robot-local frame
+    xs = jp.linspace(-0.6, 0.6, 9) + robot_x
+    ys = jp.linspace(-0.4, 0.4, 7) + robot_y
+
+    # Flatten grid: (9*7,) queries
+    grid_x, grid_y = jp.meshgrid(xs, ys, indexing='ij')
+    grid_x = grid_x.ravel()
+    grid_y = grid_y.ravel()
+
+    # Vectorized height query via vmap
+    heights = jax.vmap(self._get_terrain_height)(grid_x, grid_y)
+
+    # Return relative to robot z-height
+    return heights - robot_z
+
   def reset(self, rng: jax.Array) -> mjx_env.State:
     qpos = self._init_q
     qvel = jp.zeros(self.mjx_model.nv)
@@ -155,6 +250,11 @@ class Joystick(go1_base.Go1Env):
     rng, key = jax.random.split(rng)
     dxy = jax.random.uniform(key, (2,), minval=-0.5, maxval=0.5)
     qpos = qpos.at[0:2].set(qpos[0:2] + dxy)
+
+    # Terrain-aware spawning: set z above heightfield at spawn (x, y).
+    terrain_z = self._get_terrain_height(qpos[0], qpos[1])
+    qpos = qpos.at[2].set(terrain_z + self._init_q[2])
+
     rng, key = jax.random.split(rng)
     yaw = jax.random.uniform(key, (1,), minval=-3.14, maxval=3.14)
     quat = math.axis_angle_to_quat(jp.array([0, 0, 1]), yaw)
@@ -229,6 +329,9 @@ class Joystick(go1_base.Go1Env):
         "pert_steps": 0,
         "pert_dir": jp.zeros(3),
         "pert_mag": pert_mag,
+        # Stagnation detection state.
+        "step_count": jp.int32(0),
+        "stagnation_anchor": qpos[:2],  # (x, y) at last check.
     }
 
     metrics = {}
@@ -271,6 +374,22 @@ class Joystick(go1_base.Go1Env):
 
     obs = self._get_obs(data, state.info)
     done = self._get_termination(data)
+
+    # Stagnation termination: if robot hasn't moved enough, terminate.
+    if self._config.stagnation_termination:
+      step_count = state.info["step_count"] + 1
+      interval = self._config.stagnation_check_interval
+      is_check_step = (step_count % interval) == 0
+      xy_pos = data.qpos[:2]
+      displacement = jp.linalg.norm(xy_pos - state.info["stagnation_anchor"])
+      cmd_norm = jp.linalg.norm(state.info["command"])
+      stagnant = (displacement < self._config.stagnation_min_displacement) & (cmd_norm > 0.1)
+      done = jp.where(is_check_step & stagnant, True, done)
+      # Update anchor and counter
+      state.info["stagnation_anchor"] = jp.where(
+          is_check_step, xy_pos, state.info["stagnation_anchor"]
+      )
+      state.info["step_count"] = step_count
 
     rewards = self._get_reward(
         data, action, state.info, state.metrics, done, first_contact, contact
@@ -371,6 +490,9 @@ class Joystick(go1_base.Go1Env):
     angvel = self.get_global_angvel(data)
     feet_vel = data.sensordata[self._foot_linvel_sensor_adr].ravel()
 
+    # Height samples around robot (63 values, zeros on flat terrain).
+    height_samples = self._get_height_samples(data)
+
     privileged_state = jp.hstack([
         state,
         gyro,  # 3
@@ -386,6 +508,7 @@ class Joystick(go1_base.Go1Env):
         info["feet_air_time"],  # 4
         data.xfrc_applied[self._torso_body_id, :3],  # 3
         info["steps_since_last_pert"] >= info["steps_until_next_pert"],  # 1
+        height_samples,  # 63 (9x7 grid around robot)
     ])
 
     return {
@@ -431,6 +554,7 @@ class Joystick(go1_base.Go1Env):
             info["feet_air_time"], first_contact, info["command"]
         ),
         "dof_pos_limits": self._cost_joint_pos_limits(data.qpos[7:]),
+        "forward_progress": self._reward_forward_progress(data, info),
     }
 
   # Tracking rewards.
@@ -548,6 +672,23 @@ class Joystick(go1_base.Go1Env):
     rew_air_time = jp.sum((air_time - 0.1) * first_contact)
     rew_air_time *= cmd_norm > 0.01  # No reward for zero commands.
     return rew_air_time
+
+  # Forward progress reward (terrain traversal incentive).
+
+  def _reward_forward_progress(
+      self, data: mjx.Data, info: dict[str, Any]
+  ) -> jax.Array:
+    """Reward for moving in the commanded direction.
+
+    Projects actual velocity onto command direction. Only active when
+    a non-trivial command is present (norm > 0.1 m/s).
+    """
+    vel_actual = self.get_local_linvel(data)[:2]
+    cmd = info["command"][:2]
+    cmd_norm = jp.linalg.norm(cmd) + 1e-6
+    cmd_dir = cmd / cmd_norm
+    progress = jp.dot(vel_actual, cmd_dir)
+    return jp.where(cmd_norm > 0.1, jp.clip(progress, -1.0, 2.0), 0.0)
 
   # Perturbation and command sampling.
 
